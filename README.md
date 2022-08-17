@@ -1,4 +1,4 @@
-# Python Simple Port Scanner
+# Python Simple Network Scanner
 
 Educational project to build a simple port scanner in Python using Scapy.
 
