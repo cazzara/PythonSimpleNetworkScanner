@@ -10,9 +10,9 @@ import time
 import csv
 from collections import defaultdict
 import concurrent.futures
+from cli import get_parser
 
 logger = logging.getLogger()
-
 
 
 class NetworkScanTarget:
@@ -20,7 +20,7 @@ class NetworkScanTarget:
     Object used to represent a discovered scan target
     """
 
-    def __init__(self, ip, mac, vendor="UNKNOWN"):
+    def __init__(self, ip, mac="UNKNOWN", vendor="UNKNOWN"):
         self._ip_addr = ip
         self._mac_addr = mac
         self._mac_addr_vendor = vendor
@@ -65,25 +65,35 @@ class NetworkScanTarget:
                 print("\t" + " - ".join(port_info))
 
 
-
 class NetworkScan:
     """
     Run a scan against an IPv4 network. Gets the local IP, subnet, and default gateway info
     The different discovery methods are termed "scan phases", ex ARP discovery phase, ICMP discovery phase
     ProcessPoolExecutor multiprocessing module is used to run the scan phases.
+
+    Local
+        Discovery Methods - ARP, ICMP?
+    Remote 
+        Discovery Methods - ICMP, SYN
     """
-    
+
     NMAP_MAC_ADDR_LIST_FILENAME = "data/nmap-mac-prefixes"
     NMAP_DATA_FILE_LOCATION = "data/nmap-services"
 
-    def __init__(self, network=None, interface=None):
+    def __init__(self, interface, targets, num_ports):
         _network_info = self._get_ipv4_interface_info(interface)
         self._mac_addr = _network_info["mac_addr"]
         self._ip_addr = _network_info["addr"]
         self._subnet = _network_info["netmask"]
+        self._target_list = targets
+        self._local_scan = self._is_local_scan(self.network, self.target_list)
+        self._num_ports = num_ports
 
         # {"192.168.1.1": NetworkScanTarget, ...}
         self._discovered_targets = {}
+
+    def _is_local_scan(self, interface_network, targets):
+        return all(target in interface_network for target in targets) 
 
     @property
     def ip_addr(self):
@@ -102,10 +112,33 @@ class NetworkScan:
 
     @property
     def network(self):
+        """Local IPv4Network of host running the scan"""
         return IPv4Network(f"{self.ip_addr}/{self.subnet}", strict=False)
 
-    def add_host(self, ip, mac, vendor):
-        self._discovered_targets[ip] = NetworkScanTarget(ip, mac, vendor)
+    @property
+    def target_list(self):
+        """List of IPv4Address targets of the scan"""
+        return self._target_list
+
+    @property
+    def local_network_scan(self):
+        """Are we scanning the same network as the interface? (will use local discovery/scan methods)"""
+        return self._is_local_scan
+
+    @property
+    def num_ports(self):
+        """Number of ports to probe on each target as part of the network scan"""
+        return self._num_ports
+
+    def add_host(self, ip="UNKNOWN", mac="UNKNOWN", vendor="UNKNOWN"):
+        old_host = self._discovered_targets.get(ip)
+        if old_host is not None:
+            ip = ip if old_host.ip_addr == "UNKNOWN" else old_host.ip_addr
+            mac = mac if old_host.mac_addr == "UNKNOWN" else old_host.mac_addr
+            vendor = vendor if old_host.vendor == "UNKNOWN" else old_host.vendor
+            self._discovered_targets[ip] = NetworkScanTarget(ip, mac, vendor)
+        else:
+            self._discovered_targets[ip] = NetworkScanTarget(ip, mac, vendor)
 
     def get_host_by_ip(self, ip):
         return self._discovered_targets.get(ip)
@@ -132,9 +165,9 @@ class NetworkScan:
         }
 
         """
-        IPV4 = netifaces.AF_INET # 2
+        IPV4 = netifaces.AF_INET  # 2
         # IPV6 = netifaces.AF_INET6 # 30
-        MAC_ADDR = netifaces.AF_LINK # 18
+        MAC_ADDR = netifaces.AF_LINK  # 18
 
         if not interface:
             _, interface = netifaces.gateways()["default"][IPV4]
@@ -143,6 +176,7 @@ class NetworkScan:
 
         for mac, iface_info in zip(iface_hw_addresses, iface_addresses):
             iface_info.update({"mac_addr": mac["addr"]})
+        # TODO: Need to handle many addresses on the interface
         return iface_addresses[0]
 
     def arp_probe(self, addr):
@@ -154,7 +188,7 @@ class NetworkScan:
         try:
             result = srp1(
                 Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=addr),
-                timeout=1,
+                timeout=2,
                 verbose=False,
             )
         except Exception as e:
@@ -162,23 +196,45 @@ class NetworkScan:
             print(e)
             return None
         if result:
-            print(f"Found {addr} at {result[ARP].hwsrc}")
+            print(f"Found {addr} via ARP at {result[ARP].hwsrc}")
             return result[ARP].hwsrc
+
+    def icmp_probe(self, addr):
+        """
+        Send an ICMP echo request to the target address
+        Check for an ICMP echo reply to determine if the target is live.
+        """
+        try:
+            result = sr1(IP(dst=addr) / ICMP(), timeout=2, verbose=False,)
+        except Exception as e:
+            print(f"Unable to discover {addr} via ICMP")
+            print(e)
+        if result:
+            print(f"Found {addr} via ICMP")
+            return True
+        return False
 
     def run_arp_discovery(self, hosts):
         with concurrent.futures.ProcessPoolExecutor() as executor:
-            for result, host in zip(executor.map(self.arp_probe, hosts), hosts):
-                if result:
-                    self.add_host(host, result, "UNKNOWN")
+            for mac_address, host in zip(executor.map(self.arp_probe, hosts), hosts):
+                if mac_address:
+                    self.add_host(host, mac_address)
+
+    def run_icmp_discovery(self, hosts):
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            for is_host_live, host in zip(executor.map(self.icmp_probe, hosts), hosts):
+                if is_host_live:
+                    self.add_host(host, "UNKNOWN")
 
     def populate_mac_vendor_info(self):
         """
         For each discovered host, try to find the MAC address vendor
         """
-        vendor_info = cls.get_mac_addr_vendor_map()
+        vendor_info = self.get_mac_addr_vendor_map()
         for host in self.get_live_hosts():
-            vendor_prefix = "".join(host.mac_addr.split(":")[:3]).upper()
-            host.vendor = vendor_info.get(vendor_prefix, "UNKNOWN")
+            if host.mac_addr != "UNKNOWN":
+                vendor_prefix = "".join(host.mac_addr.split(":")[:3]).upper()
+                host.vendor = vendor_info.get(vendor_prefix, "UNKNOWN")
 
     def discover_hosts(self):
         """
@@ -187,10 +243,13 @@ class NetworkScan:
         print(
             f"Local IP Address is {self.ip_addr} - Local MAC Address is {self.mac_addr}"
         )
-        print(f"Scanning Network {self.network}")
-        host_ips = [str(host) for host in self.network.hosts()]
-        live_hosts = self.run_arp_discovery(host_ips)
-        self.populate_mac_vendor_info()
+        print(f"Scanning targets: {' '.join([str(host) for host in self.target_list])}")
+        host_ips = [str(host) for host in self.target_list]
+        if self.local_network_scan:
+            self.run_arp_discovery(host_ips)
+            self.populate_mac_vendor_info()
+        self.run_icmp_discovery(host_ips)
+
 
     def send_tcp_syn_probe(self, port_info):
         """
@@ -200,15 +259,13 @@ class NetworkScan:
         results = {}
         for host in self.get_live_host_ips():
             ans = sr1(
-                IP(dst=host)
-                / TCP(dport=int(port_num), flags="S"),
-                timeout=1,
+                IP(dst=host) / TCP(dport=int(port_num), flags="S"),
+                timeout=2,
                 verbose=False,
             )
             if ans and self.is_tcp_port_open(ans):
                 results[host] = port_info
         return results
-
 
     def is_tcp_port_open(self, rsp):
         """
@@ -217,18 +274,21 @@ class NetworkScan:
         """
         if not rsp:
             return False
-        if rsp[TCP].flags.value == 18: # SYN-ACK
+        if rsp[TCP].flags.value == 18:  # SYN-ACK
             return True
         return False
-
 
     def run_tcp_scan(self):
         """
         Probes top N TCP ports across the discovered hosts
         Starts a process for each port and iterates through each target to probe on that port using `send_tcp_syn_probe`
         """
-        print(f"Running TCP scan on {', '.join(str(host) for host in self.get_live_host_ips())}")
-        ports = cls.get_most_common_ports(protocol="tcp", num_ports=100)
+        print(
+            f"Running TCP scan on {', '.join(str(host) for host in self.get_live_host_ips())}"
+        )
+        ports = self.get_most_common_ports(
+            protocol="tcp", num_ports=self.num_ports
+        )
         completed_targets = {}
         with concurrent.futures.ProcessPoolExecutor() as executor:
             for port, results in zip(
@@ -236,13 +296,13 @@ class NetworkScan:
             ):
                 for host_ip, port_info in results.items():
                     self.get_host_by_ip(host_ip).add_open_port_info("tcp", port_info)
-                        
 
     def display_hosts(self):
-        print(f"Found {len(self.get_live_host_ips())} hosts on the network. Scanned top 100 most frequently open ports on each host.")
+        print(
+            f"Found {len(self.get_live_host_ips())} hosts on the network. Scanned top {self.num_ports} most frequently open ports on each host."
+        )
         for host in self.get_live_hosts():
             host.display_target_info()
-
 
     @classmethod
     def get_mac_addr_vendor_map(cls):
@@ -270,7 +330,7 @@ class NetworkScan:
         return data
 
     @classmethod
-    def get_most_common_ports(cls, protocol, num_ports=100):
+    def get_most_common_ports(cls, protocol, num_ports):
         """
         Return a list of the most common (open) ports sorted by frequency. 
         Taken from nmap data - https://nmap.org/book/toc.html
@@ -297,11 +357,11 @@ class NetworkScan:
         return sorted(data, key=lambda x: x[2], reverse=True)[:num_ports]
 
 
-
-
 if __name__ == "__main__":
     start = time.time()
-    n = NetworkScan(interface="en0", network="192.168.1.0/24")
+    parser = get_parser()
+    args = parser.parse_args()
+    n = NetworkScan(interface=args.interface, targets=args.targets, num_ports=args.num_ports)
     n.discover_hosts()
     n.run_tcp_scan()
     n.display_hosts()
